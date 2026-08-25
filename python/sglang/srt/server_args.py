@@ -33,7 +33,13 @@ import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
+from sglang.srt.arg_groups.arg_utils import (
+    NS,
+    A,
+    Arg,
+    Choices,
+    add_cli_args_from_dataclass,
+)
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -109,183 +115,305 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-# Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+# --------------------------------------------------------------------------
+# Extension points: out-of-tree platforms and plugins extend these lists
+# before ServerArgs is constructed. Each list owns its adder on the line
+# below it. A list with no adder is not an extension point -- inline it into
+# the field's Arg(choices=...) instead of hoisting it here.
+# --------------------------------------------------------------------------
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
-if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-    SAMPLING_BACKEND_CHOICES.add("token_oracle")
+# --- Model loading and quantization ---
 
-LOAD_FORMAT_CHOICES = [
-    "auto",
-    "pt",
-    "safetensors",
-    "npcache",
-    "dummy",
-    "sharded_state",
-    "presharded",
-    "gguf",
-    "bitsandbytes",
-    "mistral",
-    "layered",
-    "flash_rl",
-    "remote",
-    "remote_instance",
-    "fastsafetensors",
-    "private",
-    "runai_streamer",
-]
-# NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
-# It is an internal dispatch format set automatically by ModelRunner when the
-# weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
-# choice let users create contradictory combos (see _handle_load_format).
+LOAD_FORMAT_CHOICES = Choices(
+    [
+        "auto",
+        "pt",
+        "safetensors",
+        "npcache",
+        "dummy",
+        "sharded_state",
+        "presharded",
+        "gguf",
+        "bitsandbytes",
+        "mistral",
+        "layered",
+        "flash_rl",
+        "remote",
+        "remote_instance",
+        "fastsafetensors",
+        "private",
+        "runai_streamer",
+    ]
+)
+add_load_format_choices = LOAD_FORMAT_CHOICES.add
+# LoadFormat.IPC_CACHE intentionally has no public --load-format choice. It is
+# an internal dispatch format set automatically by ModelRunner when the weight
+# cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI choice
+# let users create contradictory combos (see _handle_load_format).
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
-QUANTIZATION_CHOICES = [
-    "awq",
-    "fp8",  # MOE + linear online quantization.
-    "mxfp8",  # MOE + linear online quantization.
-    "gptq",
-    "marlin",
-    "gptq_marlin",
-    "awq_marlin",
-    "bitsandbytes",
-    "gguf",
-    # Modelopt has some online quantization support through ModelOptModelLoader.
-    "modelopt",
-    "modelopt_fp8",
-    "modelopt_fp4",
-    "nvfp4_online",
-    "modelopt_mixed",
-    "petit_nvfp4",
-    "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
-    "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
-    "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
-    "w4afp8",
-    "mxfp4",  # MOE-only.
-    "auto-round",
-    "auto-round-int8",
-    "compressed-tensors",  # for Ktransformers
-    "modelslim",  # for NPU
-    "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
-    "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
-    "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
-    # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
-    # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
-    "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
-    "mlx_q8",  # 8 bits, group_size=64
-    "unquant",
-    "humming",
-]
+QUANTIZATION_CHOICES = Choices(
+    [
+        "awq",
+        "fp8",  # MOE + linear online quantization.
+        "mxfp8",  # MOE + linear online quantization.
+        "gptq",
+        "marlin",
+        "gptq_marlin",
+        "awq_marlin",
+        "bitsandbytes",
+        "gguf",
+        # Modelopt has some online quantization support through ModelOptModelLoader.
+        "modelopt",
+        "modelopt_fp8",
+        "modelopt_fp4",
+        "nvfp4_online",
+        "modelopt_mixed",
+        "petit_nvfp4",
+        "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+        "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+        "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
+        "w4afp8",
+        "mxfp4",  # MOE-only.
+        "auto-round",
+        "auto-round-int8",
+        "compressed-tensors",  # for Ktransformers
+        "modelslim",  # for NPU
+        "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
+        "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
+        "quark_int4fp8_moe",
+        "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
+        # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
+        # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
+        "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
+        "mlx_q8",  # 8 bits, group_size=64
+        "unquant",
+        "humming",
+    ]
+)
+add_quantization_method_choices = QUANTIZATION_CHOICES.add
 
-ATTENTION_BACKEND_CHOICES = [
-    # Common
-    "triton",
-    "torch_native",
-    "flex_attention",
-    "dsa",
-    "nsa",  # Deprecated alias for "dsa"
-    "dsv4",
-    "compressed",  # Deprecated alias for "dsv4"
-    # NVIDIA specific
-    "cutlass_mla",
-    "fa3",
-    "fa4",
-    "flashinfer",
-    "flashmla",
-    "trtllm_mla",
-    "cutedsl_mla",
-    "tokenspeed_mla",
-    "trtllm_mha",
-    "dual_chunk_flash_attn",
-    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
-    "minicpm_flashattn",
-    "minicpm_flashinfer",
-    # AMD specific
-    "aiter",
-    "wave",
-    # Other platforms
-    "intel_amx",
-    "ascend",
-    "intel_xpu",
-]
+# --- Attention backends ---
 
-# trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
-# earlier when its per-layer attention requirements are not met.
-DRAFT_ATTENTION_BACKEND_CHOICES = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "ascend",
-    "trtllm_mha",
-]
+ATTENTION_BACKEND_CHOICES = Choices(
+    [
+        # Common
+        "triton",
+        "torch_native",
+        "flex_attention",
+        "dsa",
+        "nsa",  # Deprecated alias for "dsa"
+        "dsv4",
+        "compressed",  # Deprecated alias for "dsv4"
+        # NVIDIA specific
+        "cutlass_mla",
+        "fa3",
+        "fa4",
+        "flashinfer",
+        "flashmla",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+        "trtllm_mha",
+        "dual_chunk_flash_attn",
+        "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
+        "minicpm_flashattn",
+        "minicpm_flashinfer",
+        # AMD specific
+        "aiter",
+        "wave",
+        # Other platforms
+        "intel_amx",
+        "ascend",
+        "intel_xpu",
+    ]
+)
+add_attention_backend_choices = ATTENTION_BACKEND_CHOICES.add
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
 # Out-of-tree platforms may extend this list (via
 # add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
 # the chunked-prefix gate is evaluated during resolution.
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = Choices(
+    [
+        "flashinfer",
+        "fa3",
+        "fa4",
+        "flashmla",
+        "cutedsl_mla",
+        "cutlass_mla",
+        "trtllm_mla",
+        "tokenspeed_mla",
+    ]
+)
+add_chunked_prefix_cache_attention_backend = (
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.add
+)
+
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = Choices(
+    [
+        "ascend",
+        "fa3",
+        "fa4",
+        "flashinfer",
+        "intel_xpu",
+        "triton",
+    ]
+)
+add_deterministic_attention_backend_choices = (
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.add
+)
+
+# trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
+# earlier when its per-layer attention requirements are not met.
+DRAFT_ATTENTION_BACKEND_CHOICES = Choices(
+    [
+        "flashinfer",
+        "fa3",
+        "fa4",
+        "triton",
+        "ascend",
+        "trtllm_mha",
+    ]
+)
+add_draft_attention_backend_choices = DRAFT_ATTENTION_BACKEND_CHOICES.add
+
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = Choices(
+    ["ascend", "fa3", "fa4", "triton"]
+)
+add_radix_supported_deterministic_attention_backend_choices = (
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.add
+)
+
+# --- Linear attention ---
+
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = Choices(
+    [
+        "triton",
+        "cutedsl",
+        "flashinfer",
+        "flashkda",
+        "nvidia_kda",
+        "ptx_kda",
+        "helion",
+        "intel_xpu",
+    ]
+)
+add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.add
+
+# --- MoE and GEMM runners ---
+
+FP4_GEMM_RUNNER_BACKEND_CHOICES = Choices(
+    [
+        "auto",
+        "flashinfer_cudnn",
+        "flashinfer_cutedsl",
+        "flashinfer_cutlass",
+        "flashinfer_trtllm",
+        "marlin",
+    ]
+)
+add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.add
+
+FP8_GEMM_RUNNER_BACKEND_CHOICES = Choices(
+    [
+        "auto",
+        "deep_gemm",
+        "flashinfer_trtllm",
+        "flashinfer_cutlass",
+        "flashinfer_deepgemm",
+        "flashinfer_cutedsl",
+        "cutlass",
+        "triton",
+        "aiter",
+    ]
+)
+add_fp8_gemm_runner_backend_choices = FP8_GEMM_RUNNER_BACKEND_CHOICES.add
+
+MOE_RUNNER_BACKEND_CHOICES = Choices(
+    [
+        "auto",
+        "deep_gemm",
+        "triton",
+        "triton_kernel",
+        "flashinfer_trtllm",
+        "experimental_sgl_trtllm",
+        "flashinfer_trtllm_routed",
+        "flashinfer_cutlass",
+        "flashinfer_mxfp4",
+        "flashinfer_cutedsl",
+        "cutlass",
+        "aiter",
+        "marlin",
+        "humming",
+        "experimental_sgl_marlin",
+        "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+        "megamoe",
+    ]
+)
+add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.add
+
+MXFP8_MOE_RUNNER_BACKEND_CHOICES = Choices(
+    [
+        "cutlass",
+        "deep_gemm",
+        "flashinfer_trtllm",
+        "flashinfer_trtllm_routed",
+    ]
+)
+add_mxfp8_moe_runner_backend_choices = MXFP8_MOE_RUNNER_BACKEND_CHOICES.add
+
+# --- Cache and scheduling policy ---
+
+RADIX_EVICTION_POLICY_CHOICES = Choices(["lru", "lfu", "slru", "priority"])
+add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.add
+
+# --- Sampling and grammar ---
+
+GRAMMAR_BACKEND_CHOICES = Choices(["xgrammar", "outlines", "llguidance", "none"])
+add_grammar_backend_choices = GRAMMAR_BACKEND_CHOICES.add
+
+SAMPLING_BACKEND_CHOICES = Choices(["flashinfer", "pytorch", "ascend"])
+add_sampling_backend_choices = SAMPLING_BACKEND_CHOICES.add
+
+# --- Transport ---
+
+DISAGG_TRANSFER_BACKEND_CHOICES = Choices(
+    [
+        "mooncake",
+        "nixl",
+        "ascend",
+        "fake",
+        "mori",
+        "mooncake_tcp",
+    ]
+)
+add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.add
+
+# --- Reinforcement learning ---
+
+RL_ON_POLICY_TARGET_CHOICES = Choices(["fsdp"])
+add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.add
+
+# --------------------------------------------------------------------------
+# Shared choice lists. Referenced by more than one field, so they keep a
+# name -- but nothing extends them, so they get no adder.
+# --------------------------------------------------------------------------
+
+DSA_CHOICES = [
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+    "flashmla_kv",
+    "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
-
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
-    "ascend",
-    "fa3",
-    "fa4",
-    "flashinfer",
-    "intel_xpu",
-    "triton",
-]
-
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
-
-DISAGG_TRANSFER_BACKEND_CHOICES = [
-    "mooncake",
-    "nixl",
-    "ascend",
-    "fake",
-    "mori",
-    "mooncake_tcp",
-]
-
-GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
-
-# Placeholder token inserted between items in Multi-Item Scoring sequences:
-# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
-# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
-# attention mask compat and logprob column indexing. Will be removed once the
-# attention backend supports position-only MIS.
-MIS_DELIMITER_TOKEN_ID = 9999
-
-MOE_RUNNER_BACKEND_CHOICES = [
-    "auto",
-    "deep_gemm",
-    "triton",
-    "triton_kernel",
-    "flashinfer_trtllm",
-    "experimental_sgl_trtllm",
-    "flashinfer_trtllm_routed",
-    "flashinfer_cutlass",
-    "flashinfer_mxfp4",
-    "flashinfer_cutedsl",
-    "cutlass",
+    "tilelang",
     "aiter",
-    "marlin",
-    "humming",
-    "experimental_sgl_marlin",
-    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
-    "megamoe",
+    "trtllm",
 ]
+
+DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 MOE_A2A_BACKEND_CHOICES = [
     "none",
@@ -300,179 +428,38 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_tp",
 ]
 
-MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
-    "cutlass",
-    "deep_gemm",
-    "flashinfer_trtllm",
-    "flashinfer_trtllm_routed",
-]
+PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 
-FP8_GEMM_RUNNER_BACKEND_CHOICES = [
-    "auto",
-    "deep_gemm",
-    "flashinfer_trtllm",
-    "flashinfer_cutlass",
-    "flashinfer_deepgemm",
-    "flashinfer_cutedsl",
-    "cutlass",
-    "triton",
-    "aiter",
-]
+# --------------------------------------------------------------------------
+# Scalar defaults and sentinels.
+# --------------------------------------------------------------------------
 
-FP4_GEMM_RUNNER_BACKEND_CHOICES = [
-    "auto",
-    "flashinfer_cudnn",
-    "flashinfer_cutedsl",
-    "flashinfer_cutlass",
-    "flashinfer_trtllm",
-    "marlin",
-]
-
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
-
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
-RETRACTION_POLICY_CHOICES = ["length", "priority"]
-
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
 # Speculative algorithms whose verify forward presents a uniform per-request
 # token width, which is what the LoRA segment layout assumes.
 _LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
 
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
+# Placeholder token inserted between items in Multi-Item Scoring sequences:
+# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
+# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
+# attention mask compat and logprob column indexing. Will be removed once the
+# attention backend supports position-only MIS.
+MIS_DELIMITER_TOKEN_ID = 9999
 
-ENCODER_TRANSFER_BACKEND_CHOICES = [
-    "auto",
-    "zmq_to_scheduler",
-    "zmq_to_tokenizer",
-    "mooncake",
-]
+# --------------------------------------------------------------------------
+# Deprecated aliases.
+# --------------------------------------------------------------------------
 
-
-def resolve_encoder_transfer_backend(
-    backend: str, model_arch: str, tp_size: int
-) -> str:
-    if backend != "auto":
-        return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
-        return "zmq_to_tokenizer"
-    return "zmq_to_scheduler"
-
-
-DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
-NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
-
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
-
-DEFAULT_LORA_EVICTION_POLICY = "lru"
-
-DSA_CHOICES = [
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-    "flashmla_kv",
-    "flashmla_auto",
-    "flashinfer_sparse_mla",
-    "fa3",
-    "tilelang",
-    "aiter",
-    "trtllm",
-]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
-DSV4_PREFILL_BACKEND_CHOICES = [
-    "auto",
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-]
+NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
 
-DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
-
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
-
-MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
-    "auto",
-    "no_buffer",
-    "extra_buffer",
-    "extra_buffer_lazy",
-]
-
-MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
-    "triton",
-    "cutedsl",
-    "flashinfer",
-    "flashkda",
-    "nvidia_kda",
-    "ptx_kda",
-    "helion",
-    "intel_xpu",
-]
-
-
-# Allow external code to add more choices
-def add_load_format_choices(choices):
-    LOAD_FORMAT_CHOICES.extend(choices)
-
-
-def add_quantization_method_choices(choices):
-    QUANTIZATION_CHOICES.extend(choices)
-
-
-def add_attention_backend_choices(choices):
-    ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_draft_attention_backend_choices(choices):
-    DRAFT_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-
-
-def add_deterministic_attention_backend_choices(choices):
-    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_supported_deterministic_attention_backend_choices(choices):
-    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
-
-
-def add_disagg_transfer_backend_choices(choices):
-    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
-
-
-def add_grammar_backend_choices(choices):
-    GRAMMAR_BACKEND_CHOICES.extend(choices)
-
-
-def add_moe_runner_backend_choices(choices):
-    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_mxfp8_moe_runner_backend_choices(choices):
-    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp8_gemm_runner_backend_choices(choices):
-    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp4_gemm_runner_backend_choices(choices):
-    FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_eviction_policy_choices(choices):
-    RADIX_EVICTION_POLICY_CHOICES.extend(choices)
-
-
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
-
-
-def add_linear_attn_kernel_backend_choices(choices):
-    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+# --------------------------------------------------------------------------
+# Append new extension points at the END of the matching group above. A new
+# choice list is inlined into its field by default; hoisting one here makes
+# it public API for out-of-tree code and is a deliberate decision.
+# --------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -515,6 +502,25 @@ class ServerArgs:
        - The ``--config`` meta-argument (not a dataclass field).
 
        Everything else should use the ``A[T, ...]`` annotation.
+
+    4. **Append, don't prepend.** New fields go at the end of their section,
+       new ``add_cli_args`` entries at the end of their subsection, and new
+       resolution steps at the end of ``_run_resolution_pipeline`` (above the
+       ``materialize_declarations`` banner). Existing early entries are early
+       because something depends on them being so.
+
+    5. **Choice lists.** Put the values inline in ``Arg(choices=[...])``. A
+       module-level ``*_CHOICES`` list means "out-of-tree code extends this",
+       and each one owns its ``add_*`` alias on the line below it. Do not
+       hoist a list just to name it, and do not write
+       ``choices=SOME_LIST + ["extra"]`` -- that snapshots at class-definition
+       time and silently stops tracking extensions.
+
+    6. **Deprecating a flag.** Mark the registration with
+       ``# Deprecated YYYY-MM-DD``. Within 2 months it may redirect
+       (``DeprecatedAliasStoreAction`` and friends); after 2 months it becomes
+       a hard error (``DeprecatedAction(error_message=...)``); after 4 months
+       the flag, its field, and its handler branch are deleted.
     """
 
     # -------------------------------------------------------------------------
@@ -915,7 +921,7 @@ class ServerArgs:
                 "requests first, using the same priority direction as priority "
                 "scheduling."
             ),
-            choices=RETRACTION_POLICY_CHOICES,
+            choices=["length", "priority"],
         ),
         NS("schedule"),
     ] = "length"
@@ -1782,7 +1788,8 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Choose the kernels for sampling layers.",
-            choices=SAMPLING_BACKEND_CHOICES,
+            # Registered in add_cli_args: the choice set is env-gated.
+            no_cli=True,
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1843,7 +1850,7 @@ class ServerArgs:
         Arg(
             help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
-            choices=BF16_GEMM_BACKEND_CHOICES,
+            choices=["auto", "cutedsl", "gemv", "torch"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1864,7 +1871,11 @@ class ServerArgs:
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
                 "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
             ),
-            choices=DSV4_PREFILL_BACKEND_CHOICES,
+            choices=[
+                "auto",
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+            ],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1881,7 +1892,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
-            choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
+            choices=["auto", "deepgemm", "cutedsl", "aiter"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1889,7 +1900,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=DSA_TOPK_BACKEND_CHOICES,
+            choices=["sgl-kernel", "torch", "flashinfer"],
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
@@ -1912,7 +1923,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
-            choices=MAMBA_BACKEND_CHOICES,
+            choices=["triton", "flashinfer"],
         ),
         NS("exec.mamba"),
     ] = "triton"
@@ -2092,9 +2103,6 @@ class ServerArgs:
         "Enable INT8 quantization of TP communications (limited support).",
         NS("exec.comm"),
     ] = False
-    enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True), NS("exec.comm")] = (
-        False
-    )
     enforce_disable_flashinfer_allreduce_fusion: A[
         bool, "Enforce disable FlashInfer allreduce fusion.", NS("exec.comm")
     ] = False
@@ -2646,7 +2654,12 @@ class ServerArgs:
         str,
         Arg(
             help="The strategy to use for mamba radix cache.",
-            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            choices=[
+                "auto",
+                "no_buffer",
+                "extra_buffer",
+                "extra_buffer_lazy",
+            ],
             resolvable=True,
         ),
         NS("exec.mamba"),
@@ -2703,7 +2716,23 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
+            # Spelled out rather than LINEAR_ATTN_KERNEL_BACKEND_CHOICES +
+            # ["nv_cutedsl"]: the concatenation snapshots at class-definition
+            # time, so the field would silently stop tracking extensions the
+            # other three linear-attn fields still see. nv_cutedsl is
+            # verify-only (kda_backend fused verify), hence not in the shared
+            # list; this field is therefore not an extension point.
+            choices=[
+                "triton",
+                "cutedsl",
+                "flashinfer",
+                "flashkda",
+                "nvidia_kda",
+                "ptx_kda",
+                "helion",
+                "intel_xpu",
+                "nv_cutedsl",
+            ],
         ),
         NS("exec.mamba"),
     ] = None
@@ -3015,7 +3044,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=LORA_BACKEND_CHOICES,
+            choices=["triton", "csgmv", "ascend", "torch_native"],
         ),
         NS("lora"),
     ] = "csgmv"
@@ -3270,10 +3299,15 @@ class ServerArgs:
         str,
         Arg(
             help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
-            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+            choices=[
+                "auto",
+                "zmq_to_scheduler",
+                "zmq_to_tokenizer",
+                "mooncake",
+            ],
         ),
         NS("disagg"),
-    ] = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    ] = "auto"
     encoder_urls: A[List[str], "List of encoder server urls.", NS("disagg")] = (
         dataclasses.field(default_factory=list)
     )
@@ -3790,6 +3824,19 @@ class ServerArgs:
         5. Give each handler one clear contract: what state it expects, what it
            may mutate, and whether it validates only. Long ordering comments
            belong in the helper or signal that the helper should be split.
+        6. APPEND, DO NOT PREPEND. A new step goes at the END of this method,
+           immediately above the materialize_declarations() call. The steps at
+           the top are there because something below them depends on their
+           output; a new step has no such claim, and inserting it at the top
+           silently reorders every dependency beneath it. Moving a step
+           earlier requires a written reason in that handler's docstring.
+        7. Every handler placed above the dummy-model boundary states why in
+           its own docstring: which dummy-path consumer needs it (a unit
+           fixture, a direct handler call, an error that must fire for dummy
+           models). Without that sentence, the handler belongs below.
+        8. No inline imports and no inline calls in this body. A hook needing
+           a deferred import gets a thin self._handle_* wrapper that performs
+           the import and the call.
         """
 
         # What the caller asked for, before any handler runs; this plus the
@@ -3804,16 +3851,12 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
-
-        handle_mega_moe(self)
+        # Everything above the dummy-model boundary states why it is there.
+        self._handle_moe_backend_aliases()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
-
-        # Reject an explicitly enabled but incompatible hardware runtime before
-        # model path resolution, downloads, or the dummy-model short circuit.
         self._handle_hardware_runtime_validation()
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3845,11 +3888,7 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
-        # Model-arch prefill CUDA-graph default must land before cuda-graph
-        # resolution (the declarative registry materializes too late to affect
-        # it). Inkling opts into full-graph prefill capture here.
-        self._apply_inkling_prefill_cuda_graph_default()
-        self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
+        self._apply_model_arch_cuda_graph_defaults()
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
         self._handle_dwdp()
@@ -3863,13 +3902,7 @@ class ServerArgs:
         self._handle_mps_backends()
         self._handle_xpu_backends()
 
-        # OOT platform plugins set fields directly (an interface this tree
-        # does not own); the diff records what they applied.
-        declare_direct_writes(
-            self,
-            f"platform:{current_platform.device_name}",
-            current_platform.apply_server_args_defaults,
-        )
+        self._handle_platform_defaults()
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
@@ -3938,9 +3971,7 @@ class ServerArgs:
         self._handle_pipeline_parallelism()
 
         # Handle speculative decoding logic.
-        from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-
-        handle_speculative_decoding(self)
+        self._handle_speculative_decoding()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -3980,6 +4011,12 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
+        # ------------------------------------------------------------------
+        # APPEND NEW RESOLUTION STEPS DIRECTLY ABOVE THIS BANNER, not at the
+        # top of the method. See principle 6. materialize_declarations() must
+        # stay the last statement.
+        # ------------------------------------------------------------------
+
         # End of resolution: apply the accumulated declarations onto the
         # fields once (gate order). From here on server_args carries the
         # resolved configuration — post-init readers, in any process, read
@@ -3988,7 +4025,43 @@ class ServerArgs:
 
         materialize_declarations(self)
 
+    def _handle_moe_backend_aliases(self):
+        """Normalize the MoE runner/a2a backend aliases.
+
+        Above the dummy-model boundary: --moe-runner-backend megamoe is a CLI
+        alias that must be rewritten before anything reads the pair, and
+        --enable-w4a4-mxfp4-megamoe sets DeepGEMM env vars that a dummy-model
+        launch still expects (test_server_args.py::test_w4a4_mxfp4_megamoe_*).
+        Cannot move down: _handle_cuda_graph_config and
+        _handle_gpu_memory_settings both branch on moe_a2a_backend.
+        """
+        from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
+
+        handle_mega_moe(self)
+
+    def _handle_platform_defaults(self):
+        """Let the active platform plugin apply its own defaults.
+
+        OOT plugins set fields directly (an interface this tree does not own);
+        the diff records what they applied.
+        """
+        declare_direct_writes(
+            self,
+            f"platform:{current_platform.device_name}",
+            current_platform.apply_server_args_defaults,
+        )
+
+    def _handle_speculative_decoding(self):
+        from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+
+        handle_speculative_decoding(self)
+
     def _handle_return_hidden_states_mode(self):
+        """Reconcile --return-hidden-states-mode with the legacy boolean.
+
+        Above the dummy-model boundary: dummy-path callers read the reconciled
+        pair (test_server_args.py::test_return_hidden_states_mode_configuration).
+        """
         if self.return_hidden_states_mode not in (None, "last", "full"):
             raise ValueError(
                 "return_hidden_states_mode must be one of: None, 'last', or 'full'."
@@ -4342,7 +4415,14 @@ class ServerArgs:
                     )
 
     def _handle_media_url_security(self):
-        """Normalize and publish the media URL policy before workers start."""
+        """Normalize and publish the media URL policy before workers start.
+
+        Above the dummy-model boundary: besides setting the process-wide
+        policy (which serving workers re-apply themselves), this writes the
+        normalized allowed_media_domains back onto the record, and dummy-path
+        callers read it (test_server_args_migration.py::
+        test_media_url_security_args).
+        """
         self._declare(
             "_handle_media_url_security",
             allowed_media_domains=configure_media_url_security(
@@ -4352,6 +4432,7 @@ class ServerArgs:
         )
 
     def _handle_deprecated_args(self):
+        # Deprecated 2026-08-12
         if self.disable_fast_image_processor:
             if self.image_processor_backend not in {"auto", "pil"}:
                 raise ValueError(
@@ -4364,34 +4445,6 @@ class ServerArgs:
             )
             self._declare("_handle_deprecated_args", image_processor_backend="pil")
 
-        # Handle deprecated tool call parsers
-        deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
-        if self.tool_call_parser in deprecated_tool_call_parsers:
-            logger.warning(
-                f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
-            )
-            self._declare(
-                "_handle_deprecated_args",
-                tool_call_parser=deprecated_tool_call_parsers[self.tool_call_parser],
-            )
-
-        # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
-        if (
-            self.enable_flashinfer_allreduce_fusion
-            and self.flashinfer_allreduce_fusion_backend is None
-        ):
-            logger.warning(
-                "--enable-flashinfer-allreduce-fusion is deprecated. "
-                "Please use --flashinfer-allreduce-fusion-backend=auto instead."
-            )
-            self._declare(
-                "_handle_deprecated_args",
-                flashinfer_allreduce_fusion_backend="auto",
-            )
-        self._declare(
-            "_handle_deprecated_args",
-            enable_flashinfer_allreduce_fusion=False,
-        )
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         renamed = {}
         for attr in (
@@ -4409,7 +4462,7 @@ class ServerArgs:
         if renamed:
             self._declare("_handle_deprecated_args", **renamed)
 
-        # --grpc-mode is a deprecated alias for --smg-grpc-mode.
+        # Deprecated 2026-07-08: --grpc-mode is an alias for --smg-grpc-mode.
         if self.grpc_mode and not self.smg_grpc_mode:
             logger.warning(
                 "--grpc-mode is deprecated and will be removed in a future "
@@ -4676,6 +4729,9 @@ class ServerArgs:
             )
 
     def _handle_hardware_runtime_validation(self):
+        """Above the dummy-model boundary: reject an explicitly enabled but
+        incompatible hardware runtime before model path resolution, downloads,
+        or the short circuit."""
         # This is intentionally independent of self.device: setting
         # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
         # the environment cannot honor that request. With the flag unset,
@@ -4725,6 +4781,14 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+    def _apply_model_arch_cuda_graph_defaults(self):
+        """Per-arch cuda-graph defaults that must land before cuda-graph
+        resolution: the declarative override registry materializes too late to
+        steer it. Each arch keeps its own helper below.
+        """
+        self._apply_inkling_prefill_cuda_graph_default()
+        self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
+
     def _apply_inkling_prefill_cuda_graph_default(self):
         """Inkling opts into full-graph prefill CUDA-graph capture. Must run
         before _handle_cuda_graph_config: the generic breakable default is
@@ -5989,14 +6053,6 @@ class ServerArgs:
             # kernel/page_first and direct/page_first_direct have split K/V
             # transfer paths.
         elif (
-            "Step3p5ForCausalLM" in model_arch
-            or "Step3p7ForConditionalGeneration" in model_arch
-        ):
-            # Attention backend selection + EAGLE multi-layer +
-            # hierarchical-cache SWA writes moved to the override registry
-            # (arg_groups/overrides.py: _step3p_overrides).
-            pass
-        elif (
             model_arch in ("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
             and self.device != "cpu"
         ):
@@ -6013,8 +6069,6 @@ class ServerArgs:
             }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
             # The moe_runner_backend selection moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
-        # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
-        # (arg_groups/overrides.py: _gemma2_gemma3_overrides).
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
@@ -6040,10 +6094,6 @@ class ServerArgs:
 
             # The quantization/moe_runner_backend resolution moved to the override
             # registry (arg_groups/overrides.py: _gemma4_overrides).
-        elif model_arch == "MossVLForConditionalGeneration":
-            # The prefill attention backend default + validation moved to the
-            # override registry (arg_groups/overrides.py: _moss_vl_overrides).
-            pass
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 # disable_hybrid_swa_memory moved to the override registry
@@ -6077,26 +6127,6 @@ class ServerArgs:
                 "NemotronHForCausalLM does not support triton attention backend,"
                 "as the first layer might not be an attention layer"
             )
-        elif model_arch in [
-            "Qwen3MoeForCausalLM",
-            "Qwen3VLMoeForConditionalGeneration",
-            "Qwen3NextForCausalLM",
-            "Qwen3_5MoeForConditionalGeneration",
-            "InternS2PreviewForConditionalGeneration",
-            "Qwen3_5ForConditionalGeneration",
-        ]:
-            # The quantization/moe_runner_backend resolution moved to the
-            # override registry (arg_groups/overrides.py:
-            # _qwen3_moe_family_overrides); the hybrid sub-family's attention
-            # backend + page size defaults to _qwen3_5_hybrid_overrides.
-            pass
-
-        elif model_arch in ["Glm4MoeForCausalLM"]:
-            # The quantization/moe_runner_backend/enable_tf32_matmul resolution
-            # moved to the override registry (arg_groups/overrides.py:
-            # _glm4_moe_overrides).
-            pass
-
         elif model_arch in ["Lfm2ForCausalLM", "Lfm2MoeForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
@@ -6104,12 +6134,6 @@ class ServerArgs:
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
-
-        # MiniMaxM2ForCausalLM (enable_tf32_matmul) moved to the override registry
-        # (arg_groups/overrides.py: _minimax_m2_overrides).
-
-        # Qwen3VL aiter unified-attention page_size moved to the override registry
-        # (arg_groups/overrides.py: _qwen3vl_overrides).
 
         # Hybrid-mamba radix cache handling for the per-arch branch call sites
         # dissolved above: the resolution pass self-guards on the arch union
@@ -8335,6 +8359,10 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if self.encoder_transfer_backend == "auto":
+            from sglang.srt.arg_groups.encoder_transfer_hook import (
+                resolve_encoder_transfer_backend,
+            )
+
             self._declare(
                 "_handle_encoder_disaggregation",
                 encoder_transfer_backend=resolve_encoder_transfer_backend(
@@ -9160,6 +9188,9 @@ class ServerArgs:
             )
 
     def _validate_prefill_decode_interval(self):
+        """Above the dummy-model boundary: an argument-validation error that
+        should fire for dummy models too (test_server_args.py::
+        test_prefill_decode_interval)."""
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
 
@@ -9307,11 +9338,27 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        """Register the CLI surface.
+
+        Almost every argument is an ``A[T, Arg(...)]`` field annotation picked
+        up by add_cli_args_from_dataclass; only the three cases below are
+        registered by hand. Append to the END of the matching subsection.
+        """
 
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
+        sampling_backend_choices = list(SAMPLING_BACKEND_CHOICES)
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            sampling_backend_choices.append("token_oracle")
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=sampling_backend_choices,
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
@@ -9353,6 +9400,12 @@ class ServerArgs:
         )
 
         # --- Deprecated argument registrations ---
+        # Each entry carries the date it was deprecated. The clock:
+        #   < 2 months  -- redirect with a warning (Deprecated*Action)
+        #   2-4 months  -- hard error via DeprecatedAction(error_message=...)
+        #   > 4 months  -- delete the flag, its field, and its handler branch
+        # Ordered oldest-first; append new entries at the end.
+        # Deprecated 2026-08-16
         parser.add_argument(
             "--enable-expert-distribution-metrics",
             action=DeprecatedAction,
@@ -9366,23 +9419,7 @@ class ServerArgs:
                 "off, server_log, prometheus, both."
             ),
         )
-        parser.add_argument(
-            "--stream-output",
-            action=DeprecatedStoreTrueAction,
-            dest="incremental_streaming_output",
-            new_flag="--incremental-streaming-output",
-            help="[Deprecated] Use --incremental-streaming-output instead.",
-        )
-        parser.add_argument(
-            "--prefill-round-robin-balance",
-            action=DeprecatedAction,
-            help="Note: --prefill-round-robin-balance is deprecated now.",
-        )
-        parser.add_argument(
-            "--collect-tokens-histogram",
-            action=DeprecatedAction,
-            help="Deprecated. Token histograms are now automatically collected when --enable-metrics is set.",
-        )
+        # Deprecated 2026-05-20
         parser.add_argument(
             "--nsa-prefill-backend",
             dest="dsa_prefill_backend",
@@ -9393,6 +9430,7 @@ class ServerArgs:
             choices=DSA_CHOICES,
             help="[Deprecated] Use --dsa-prefill-backend instead.",
         )
+        # Deprecated 2026-05-20
         parser.add_argument(
             "--nsa-decode-backend",
             dest="dsa_decode_backend",
@@ -9403,6 +9441,7 @@ class ServerArgs:
             choices=DSA_CHOICES,
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
+        # Deprecated 2026-05-16
         parser.add_argument(
             "--speculative-dflash-draft-window-size",
             type=int,
@@ -9411,6 +9450,7 @@ class ServerArgs:
             new_flag="--speculative-draft-window-size",
             help=argparse.SUPPRESS,
         )
+        # Deprecated 2026-06-19
         parser.add_argument(
             "--mamba-scheduler-strategy",
             dest="mamba_radix_cache_strategy",
@@ -9420,6 +9460,7 @@ class ServerArgs:
             default=ServerArgs.mamba_radix_cache_strategy,
             help="Deprecated alias for --mamba-radix-cache-strategy.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
@@ -9428,6 +9469,7 @@ class ServerArgs:
             dest="cuda_graph_max_bs_decode",
             help="Deprecated alias for --cuda-graph-max-bs-decode.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--cuda-graph-bs",
             type=int,
@@ -9437,12 +9479,14 @@ class ServerArgs:
             dest="cuda_graph_bs_decode",
             help="Deprecated alias for --cuda-graph-bs-decode.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--disable-cuda-graph",
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
             help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--enable-breakable-cuda-graph",
             action=DeprecatedStoreConstAction,
@@ -9451,6 +9495,7 @@ class ServerArgs:
             new_flag="--cuda-graph-backend-prefill=breakable",
             help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--disable-piecewise-cuda-graph",
             action=DeprecatedStoreConstAction,
@@ -9459,6 +9504,7 @@ class ServerArgs:
             new_flag="--cuda-graph-backend-prefill=disabled",
             help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--enforce-piecewise-cuda-graph",
             action=DeprecatedStoreConstAction,
@@ -9469,6 +9515,7 @@ class ServerArgs:
             "Explicitly setting the prefill backend now skips the auto-disable "
             "cascade automatically.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
             type=int,
@@ -9478,6 +9525,7 @@ class ServerArgs:
             dest="cuda_graph_bs_prefill",
             help="Deprecated alias for --cuda-graph-bs-prefill.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",
             type=str,
@@ -9487,6 +9535,7 @@ class ServerArgs:
             dest="cuda_graph_tc_compiler",
             help="Deprecated alias for --cuda-graph-tc-compiler.",
         )
+        # Deprecated 2026-06-09
         parser.add_argument(
             "--piecewise-cuda-graph-max-tokens",
             type=int,
@@ -9495,6 +9544,7 @@ class ServerArgs:
             dest="cuda_graph_max_bs_prefill",
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
+        # Deprecated 2026-05-20
         parser.add_argument(
             "--enable-dsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
@@ -9502,6 +9552,7 @@ class ServerArgs:
             new_flag="--enable-prefill-cp",
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
+        # Deprecated 2026-05-20
         parser.add_argument(
             "--enable-nsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
@@ -9509,6 +9560,7 @@ class ServerArgs:
             new_flag="--enable-prefill-cp",
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
+        # Deprecated 2026-08-04
         parser.add_argument(
             "--enable-gdn-replayssm-spec",
             dest="enable_linear_replayssm_spec",
@@ -9516,6 +9568,7 @@ class ServerArgs:
             new_flag="--enable-linear-replayssm-spec",
             help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
         )
+        # Deprecated 2026-06-10
         parser.add_argument(
             "--enable-prefill-context-parallel",
             dest="enable_prefill_context_parallel",
@@ -9523,6 +9576,7 @@ class ServerArgs:
             new_flag="--enable-prefill-cp",
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
+        # Deprecated 2026-05-20
         parser.add_argument(
             "--dsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
@@ -9537,6 +9591,7 @@ class ServerArgs:
                 "'interleave'."
             ),
         )
+        # Deprecated 2026-05-20
         parser.add_argument(
             "--nsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
@@ -9547,6 +9602,7 @@ class ServerArgs:
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help="[Deprecated] Use --cp-strategy instead.",
         )
+        # Deprecated 2026-06-10
         parser.add_argument(
             "--prefill-cp-mode",
             dest="prefill_cp_mode",
@@ -9559,12 +9615,6 @@ class ServerArgs:
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
                 "'in-seq-split' maps to 'zigzag'."
             ),
-        )
-        parser.add_argument(
-            "--enable-flashinfer-allreduce-fusion",
-            action="store_true",
-            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
-            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
 
     @classmethod
@@ -10456,28 +10506,6 @@ def compute_world_size(server_args: ServerArgs) -> int:
         (1 if server_args.enable_dp_attention else server_args.dp_size)
         * server_args.tp_size
         * server_args.pp_size
-    )
-
-
-def m3_fp8_attn_gemm_enabled(args) -> bool:
-    """Whether MiniMax-M3 attention GEMMs run in fp8 (no opt-in flag; active
-    whenever possible): fp8_e4m3 main + index KV caches, fp8-cast q, fp8
-    sparse/MSA kernels, with dense layers on trtllm_mha's fp8-q path. Needs
-    kv_cache_dtype fp8_e4m3 (e5m2 would silently mis-dispatch fmha_sm100's
-    e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
-    GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
-    sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
-    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
-    bf16 q) without having to move off trtllm_mha.
-    """
-    from sglang.srt.environ import envs
-    from sglang.srt.utils.common import is_sm100_supported
-
-    return (
-        args.kv_cache_dtype == "fp8_e4m3"
-        and args.attention_backend == "trtllm_mha"
-        and is_sm100_supported()
-        and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
 
 
